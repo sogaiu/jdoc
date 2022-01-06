@@ -1,0 +1,22 @@
+#! /usr/bin/env janet
+
+(def arg (get (dyn :args) 1))
+
+(var doc-arg nil)
+
+(if arg
+  (if ((curenv) (symbol arg))
+    (set doc-arg arg)
+    (set doc-arg (string `"` arg `"`)))
+  (let [all (all-bindings)
+        idx (math/rng-int (math/rng (os/cryptorand 3))
+                          (length all))]
+    (set doc-arg (get all idx))))
+
+(let [code-string (string "(doc " doc-arg ")")]
+  (eval-string code-string))
+
+## future possibilities ##
+
+# * docstrings from within "current" project
+
