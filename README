@@ -44,3 +44,9 @@ example 3.
 
 $ jdoc # try and find out :)
 
+---
+
+To get bash-completion, put the output of the following in an
+approrpriate location:
+
+$ jdoc --bash-completion

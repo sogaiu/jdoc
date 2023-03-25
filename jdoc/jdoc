@@ -4,10 +4,41 @@
 
 (var doc-arg nil)
 
+(def bash-completion
+  ``
+  _jdoc_bindings() {
+      COMPREPLY=( $(compgen -W "$(jdoc --raw-all)" -- ${COMP_WORDS[COMP_CWORD]}) );
+  }
+  complete -F _jdoc_bindings jdoc
+  ``)
+
+(defn escape
+  [name]
+  # XXX: doing multiple linear searches seems bad
+  (cond
+    (string/find "*" name)
+    (string "\"" name "\"")
+    #
+    (string/find "<" name)
+    (string "\"" name "\"")
+    #
+    (string/find ">" name)
+    (string "\"" name "\"")
+    # XXX: any other characters to be careful of?
+    name))
+
 (if arg
-  (if ((curenv) (symbol arg))
-    (set doc-arg arg)
-    (set doc-arg (string `"` arg `"`)))
+  (do
+    (when (= "--raw-all" arg)
+      (each binding (all-bindings)
+        (print (escape binding)))
+      (os/exit 0))
+    (when (= "--bash-completion" arg)
+      (print bash-completion)
+      (os/exit 0))
+    (if ((curenv) (symbol arg))
+      (set doc-arg arg)
+      (set doc-arg (string `"` arg `"`))))
   (let [all (all-bindings)
         idx (math/rng-int (math/rng (os/cryptorand 3))
                           (length all))]
