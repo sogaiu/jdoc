@@ -1,5 +1,29 @@
 #! /usr/bin/env janet
 
+(def usage
+  ``
+  Usage: jdoc [option] | jdoc [identifier]
+
+  View Janet docstrings from the command line.
+
+    -h, --help                   show this output
+
+    --bash-completion            output bash-completion bits
+    --fish-completion            output fish-completion bits
+    --zsh-completion             output zsh-completion bits
+    --raw-all                    show all names for completion
+
+  With a full identifier, but no options, show docstring for
+  identifier.
+
+  With a partial identifier, but no options, show candidates
+  with docstrings.
+
+  Without an identifier, show docstring for some identifier.
+  ``)
+
+########################################################################
+
 (def arg (get (dyn :args) 1))
 
 (var doc-arg nil)
@@ -10,6 +34,28 @@
       COMPREPLY=( $(compgen -W "$(jdoc --raw-all)" -- ${COMP_WORDS[COMP_CWORD]}) );
   }
   complete -F _jdoc_bindings jdoc
+  ``)
+
+(def fish-completion
+  ``
+  function __jdoc_complete_specials
+    if not test "$__jdoc_specials"
+      set -g __jdoc_specials (jdoc --raw-all)
+    end
+
+    printf "%s\n" $__jdoc_specials
+  end
+
+  complete -c jdoc -a "(__jdoc_complete_specials)" -d 'specials'
+  ``)
+
+(def zsh-completion
+  ``
+  _jdoc_specials() {
+      local matches=(`jdoc --raw-all`)
+      compadd -a matches
+  }
+  compdef _jdoc_specials jdoc
   ``)
 
 (defn escape
@@ -27,14 +73,25 @@
     # XXX: any other characters to be careful of?
     name))
 
+########################################################################
+
 (if arg
   (do
+    (when (or (= "--help" arg) (= "-h" arg))
+      (print usage)
+      (os/exit 0))
     (when (= "--raw-all" arg)
       (each binding (all-bindings)
         (print (escape binding)))
       (os/exit 0))
     (when (= "--bash-completion" arg)
       (print bash-completion)
+      (os/exit 0))
+    (when (= "--fish-completion" arg)
+      (print fish-completion)
+      (os/exit 0))
+    (when (= "--zsh-completion" arg)
+      (print zsh-completion)
       (os/exit 0))
     (if ((curenv) (symbol arg))
       (set doc-arg arg)
