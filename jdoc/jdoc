@@ -30,32 +30,34 @@
 
 (def bash-completion
   ``
-  _jdoc_bindings() {
+  _jdoc_ids() {
       COMPREPLY=( $(compgen -W "$(jdoc --raw-all)" -- ${COMP_WORDS[COMP_CWORD]}) );
   }
-  complete -F _jdoc_bindings jdoc
+  complete -F _jdoc_ids jdoc
   ``)
 
 (def fish-completion
   ``
-  function __jdoc_complete_specials
-    if not test "$__jdoc_specials"
-      set -g __jdoc_specials (jdoc --raw-all)
+  function __jdoc_complete_ids
+    if not test "$__jdoc_ids"
+      set -g __jdoc_ids (jdoc --raw-all)
     end
 
-    printf "%s\n" $__jdoc_specials
+    printf "%s\n" $__jdoc_ids
   end
 
-  complete -c jdoc -a "(__jdoc_complete_specials)" -d 'specials'
+  complete -c jdoc -a "(__jdoc_complete_ids)" -d 'ids'
   ``)
 
 (def zsh-completion
   ``
-  _jdoc_specials() {
+  #compdef jdoc
+
+  _jdoc_ids() {
       local matches=(`jdoc --raw-all`)
       compadd -a matches
   }
-  compdef _jdoc_specials jdoc
+  _jdoc "$@"
   ``)
 
 (defn escape
