@@ -24,10 +24,6 @@
 
 ########################################################################
 
-(def arg (get (dyn :args) 1))
-
-(var doc-arg nil)
-
 (def bash-completion
   ``
   _jdoc_ids() {
@@ -77,34 +73,50 @@
 
 ########################################################################
 
-(if arg
-  (do
-    (when (or (= "--help" arg) (= "-h" arg))
-      (print usage)
-      (os/exit 0))
-    (when (= "--raw-all" arg)
-      (each binding (all-bindings)
-        (print (escape binding)))
-      (os/exit 0))
-    (when (= "--bash-completion" arg)
-      (print bash-completion)
-      (os/exit 0))
-    (when (= "--fish-completion" arg)
-      (print fish-completion)
-      (os/exit 0))
-    (when (= "--zsh-completion" arg)
-      (print zsh-completion)
-      (os/exit 0))
-    (if ((curenv) (symbol arg))
-      (set doc-arg arg)
-      (set doc-arg (string `"` arg `"`))))
-  (let [all (all-bindings)
-        idx (math/rng-int (math/rng (os/cryptorand 3))
-                          (length all))]
-    (set doc-arg (get all idx))))
+(defn main
+  [& argv]
+  (def arg (get argv 1))
 
-(let [code-string (string "(doc " doc-arg ")")]
-  (eval-string code-string))
+  # option handling, except --raw-all
+  (when (and arg
+             (string/has-prefix? "-" arg)
+             (not= "--raw-all" arg))
+    (cond
+      (or (= "--help" arg) (= "-h" arg))
+      (print usage)
+      #
+      (= "--bash-completion" arg)
+      (print bash-completion)
+      #
+      (= "--fish-completion" arg)
+      (print fish-completion)
+      #
+      (= "--zsh-completion" arg)
+      (print zsh-completion)
+      #
+      (do
+        (eprintf "unrecognized option: %s" arg)
+        (eprint "Try jdoc -h for usage.")
+        (os/exit 1)))
+    (os/exit 0))
+
+  (when (= "--raw-all" arg)
+    (each binding (all-bindings)
+      (print (escape binding)))
+    (os/exit 0))
+
+  (def doc-arg
+    (if arg
+      (if (get (curenv) (symbol arg))
+        arg
+        (string/format `"%s"` arg))
+      (do
+        (def bz (all-bindings))
+        (def idx (math/rng-int (math/rng (os/cryptorand 3))
+                               (length bz)))
+        (get bz idx))))
+
+  (eval-string (string/format "(doc %s)" doc-arg)))
 
 ## future possibilities ##
 
