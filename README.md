@@ -1,14 +1,37 @@
 # jdoc
 
-Use janet's `doc` from the command line...with convenient completion
-for supported shells.
+Use janet's `doc` macro from the command line to see Janet
+docstrings...with convenient completion for supported shells.
+
+![jdoc terminal demo](jdoc-terminal-demo.png?raw=true "jdoc terminal demo")
 
 ## Installation
 
-Using jpm:
+There are a few ways installation can be performed.  Choose one, but
+note that the uninstallation process is likely to end up being
+different.  See the [Uninstallation section](#uninstallation) later in
+this document for details.
+
+### Via `jpm`
 
 ```
 jpm install https://github.com/sogaiu/jdoc
+```
+
+### Via `janet`'s `bundle/*` functionality
+
+```
+git clone https://github.com/sogaiu/jdoc
+cd jdoc
+janet --install .
+```
+
+### Via the `install` script
+
+```
+git clone https://github.com/sogaiu/jdoc
+cd jdoc
+janet install
 ```
 
 This should make the `jdoc` command available on `PATH`.
@@ -90,3 +113,41 @@ Below are some hints about where such locations might be:
   look for `Where should I install my own local completions?`
 * [fish](https://fishshell.com/docs/current/completions.html#where-to-put-completions)
 * [zsh](https://zsh.sourceforge.io/Doc/Release/Completion-System.html) -- good luck :P
+
+## Uninstallation
+
+Depending on how installation was performed, the procedure to follow
+may differ.
+
+I don't usually remember what method was used so I first do:
+
+```
+jpm list-installed
+```
+
+and check the resulting list for `jdoc`.  If `jdoc` appears there, then
+uninstallation should be:
+
+```
+jpm uninstall jdoc
+```
+
+If `jdoc` wasn't in the output of `jpm list-installed`, then I typically
+do:
+
+```
+janet --list
+```
+
+If `jdoc` appears in that list, then uninstallation should be done by:
+
+```
+janet --uninstall jdoc
+```
+
+Note that with a proper installation, I don't think `jdoc` should
+appear in the output of both `jpm list-installed` and `janet --list`,
+but if you want to be on the careful side, you might consider running
+both commands and examining their respective output before attempting
+uninstallation commands.
+
