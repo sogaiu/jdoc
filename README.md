@@ -34,7 +34,10 @@ cd jdoc
 janet install
 ```
 
-This should make the `jdoc` command available on `PATH`.
+Note that if you haven't already modified your `PATH` to account for
+where `janet`'s `bundle/*` functionality stores scripts, you may need
+to do so.  The output of the relevant commands above should indicate
+where the script ended up.
 
 ## Usages
 
