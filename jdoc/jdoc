@@ -79,6 +79,14 @@
 
   # option handling, except --raw-all
   (when (and arg
+             (nil? (get {"-" true
+                         "--" true
+                         "-=" true
+                         "->" true
+                         "->>" true
+                         "-?>" true
+                         "-?>>" true}
+                        arg))
              (string/has-prefix? "-" arg)
              (not= "--raw-all" arg))
     (cond
@@ -95,7 +103,7 @@
       (print zsh-completion)
       #
       (do
-        (eprintf "unrecognized option: %s" arg)
+        (eprintf "unrecognized option or symbol: %s" arg)
         (eprint "Try jdoc -h for usage.")
         (os/exit 1)))
     (os/exit 0))
