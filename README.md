@@ -93,6 +93,30 @@ $ jdoc
 ...insert some docstring here...
 ```
 
+### See Some Help Text
+
+```
+$ jdoc -h
+Usage: jdoc [option] | jdoc [identifier]
+
+View Janet docstrings from the command line.
+
+  -h, --help                   show this output
+
+  --bash-completion            output bash-completion bits
+  --fish-completion            output fish-completion bits
+  --zsh-completion             output zsh-completion bits
+  --raw-all                    show all names for completion
+
+With a full identifier, but no options, show docstring for
+identifier.
+
+With a partial identifier, but no options, show candidates
+with docstrings.
+
+Without an identifier, show docstring for some identifier.
+```
+
 ## Shell Completion Use and Setup
 
 The identifier argument to `jdoc` can be completed if using the bash /
