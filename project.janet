@@ -4,6 +4,6 @@
   :repo "git+https://github.com/sogaiu/jdoc.git")
 
 (declare-binscript
-  :main "jdoc/jdoc"
+  :main "bin/jdoc"
   :is-janet true)
 

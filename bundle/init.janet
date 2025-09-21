@@ -1,4 +1,4 @@
 (defn install
   [manifest &]
-  (bundle/add-bin manifest "jdoc/jdoc"))
+  (bundle/add-bin manifest "bin/jdoc"))
 

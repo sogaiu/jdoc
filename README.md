@@ -12,6 +12,12 @@ note that the uninstallation process is likely to end up being
 different.  See the [Uninstallation section](#uninstallation) later in
 this document for details.
 
+### Via `jeep`
+
+```
+jeep install https://github.com/sogaiu/jdoc
+```
+
 ### Via `jpm`
 
 ```
@@ -146,6 +152,12 @@ If `jdoc` appears in that list, then uninstallation should be done by:
 
 ```
 janet --uninstall jdoc
+```
+
+or if using `jeep`:
+
+```
+jeep uninstall
 ```
 
 Note that with a proper installation, I don't think `jdoc` should
