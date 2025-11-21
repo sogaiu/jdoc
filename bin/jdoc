@@ -71,6 +71,26 @@
     # XXX: any other characters to be careful of?
     name))
 
+(comment
+
+  (escape "*")
+  # =>
+  `"*"`
+
+  (escape "<")
+  # =>
+  `"<"`
+
+  (escape ">")
+  # =>
+  `">"`
+
+  (escape "!")
+  # =>
+  "!"
+
+  )
+
 ########################################################################
 
 (defn main
