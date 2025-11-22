@@ -2,7 +2,7 @@
 
 (def usage
   ``
-  Usage: jdoc [option] | jdoc [identifier]
+  Usage: jdoc [option] | jdoc [identifier] [file-or-directory...]
 
   View Janet docstrings from the command line.
 
@@ -16,10 +16,14 @@
   With a full identifier, but no options, show docstring for
   identifier.
 
-  With a partial identifier, but no options, show candidates
-  with docstrings.
+  Additionaly, with one or more file-or-directory paths
+  specified, search for docstrings in paths.  Directories are
+  searched recursively for `.janet` files.
 
-  Without an identifier, show docstring for some identifier.
+  With a partial identifier, but no options, show candidates
+  with docstrings, but only for builtin janet constructs.
+
+  Without an identifier, show this output.
   ``)
 
 ########################################################################
@@ -27,9 +31,9 @@
 (def bash-completion
   ``
   _jdoc_ids() {
-      COMPREPLY=( $(compgen -W "$(jdoc --raw-all)" -- ${COMP_WORDS[COMP_CWORD]}) );
+      COMPREPLY=( $(compgen -f -d -W "$(jdoc --raw-all)" -- ${COMP_WORDS[COMP_CWORD]}) );
   }
-  complete -F _jdoc_ids jdoc
+  complete -o nospace -F _jdoc_ids jdoc
   ``)
 
 (def fish-completion
@@ -55,6 +59,2694 @@
   }
   _jdoc "$@"
   ``)
+
+########################################################################
+
+(defn parse-args
+  [args]
+  (def the-args (array ;args))
+  #
+  (def head (get the-args 0))
+  #
+  (def default-opts @{:rest the-args})
+  #
+  (when (or (not head) (= head "-h") (= head "--help"))
+    (break (merge {:help true} default-opts)))
+  #
+  (when (= "--bash-completion" head)
+    (break (merge {:bash-completion true} default-opts)))
+  #
+  (when (= "--fish-completion" head)
+    (break (merge {:fish-completion true} default-opts)))
+  #
+  (when (= "--zsh-completion" head)
+    (break (merge {:zsh-completion true} default-opts)))
+  #
+  (when (= "--raw-all" head)
+    (break (merge {:raw-all true} default-opts)))
+  #
+  (def dash-syms
+    {"-" 1 "--" 1 "-=" 1 "->" 1 "->>" 1 "-?>" 1 "-?>>" 1})
+  (when (and (nil? (get dash-syms head))
+             (string/has-prefix? "-" head))
+    (break (merge {:unknown-item head} default-opts)))
+  #
+  (def opts
+    (if-not (and (string/has-prefix? "{" head)
+                 (string/has-suffix? "}" head))
+      default-opts
+      (let [parsed
+            (try (parse (string "@" head))
+              ([e] (eprint e)
+                   (errorf "failed to parse options: %n" head)))]
+        (assertf (and parsed (table? parsed))
+                 "expected table but found: %s" (type parsed))
+        (array/remove the-args 0)
+        parsed)))
+  #
+  (merge opts default-opts
+         (if (<= 2 (length the-args))
+           {:paths-search true}
+           {:builtins-search true})))
+
+########################################################################
+
+(def sep
+  (if (= :windows (os/which))
+    `\`
+    "/"))
+
+(defn find-files
+  [dir &opt pred]
+  (default pred identity)
+  (def paths @[])
+  (defn helper
+    [a-dir]
+    (each path (os/dir a-dir)
+      (def sub-path
+        (string a-dir sep path))
+      (case (os/stat sub-path :mode)
+        :directory
+        (when (not= path ".git")
+          (when (not (os/stat (string sub-path sep ".gitrepo")))
+            (helper sub-path)))
+        #
+        :file
+        (when (pred sub-path)
+          (array/push paths sub-path)))))
+  (helper dir)
+  paths)
+
+(comment
+
+  (find-files "." |(string/has-suffix? ".janet" $))
+
+  )
+
+(defn clean-end-of-path
+  [path sep]
+  (when (one? (length path))
+    (break path))
+  (if (string/has-suffix? sep path)
+    (string/slice path 0 -2)
+    path))
+
+(comment
+
+  (clean-end-of-path "hello/" "/")
+  # =>
+  "hello"
+
+  (clean-end-of-path "/" "/")
+  # =>
+  "/"
+
+  )
+
+(defn collect-paths
+  [includes &opt pred]
+  (default pred identity)
+  (def filepaths @[])
+  # collect file and directory paths
+  (each thing includes
+    (def apath (clean-end-of-path thing sep))
+    (def mode (os/stat apath :mode))
+    # XXX: should :link be supported?
+    (cond
+      (= :file mode)
+      (array/push filepaths apath)
+      #
+      (= :directory mode)
+      (array/concat filepaths (find-files apath pred))
+      #
+      (do
+        (eprintf "No such file or not an ordinary file or directory: %s"
+                 apath)
+        (os/exit 1))))
+  #
+  filepaths)
+
+(defn search-paths
+  [query-fn opts]
+  (def {:name name :paths src-paths} opts)
+  #
+  (def all-results @[])
+  (def hit-paths @[])
+  (each path src-paths
+    (def src (slurp path))
+    (when (pos? (length src))
+      (when (or (not name)
+                (string/find name src))
+        (array/push hit-paths path)
+        (def results
+          (try
+            (query-fn src opts)
+            ([e]
+              (eprintf "search failed for: %s" path))))
+        (when (and results (not (empty? results)))
+          (each item results
+            (array/push all-results (merge item {:path path})))))))
+  #
+  [all-results hit-paths])
+
+########################################################################
+
+# bl - begin line
+# bc - begin column
+# el - end line
+# ec - end column
+(defn make-attrs
+  [& items]
+  (zipcoll [:bl :bc :el :ec]
+           items))
+
+(defn atom-node
+  [node-type peg-form]
+  ~(cmt (capture (sequence (line) (column)
+                           ,peg-form
+                           (line) (column)))
+        ,|[node-type (make-attrs ;(slice $& 0 -2)) (last $&)]))
+
+(defn reader-macro-node
+  [node-type sigil]
+  ~(cmt (capture (sequence (line) (column)
+                           ,sigil
+                           (any :non-form)
+                           :form
+                           (line) (column)))
+        ,|[node-type (make-attrs ;(slice $& 0 2) ;(slice $& -4 -2))
+           ;(slice $& 2 -4)]))
+
+(defn collection-node
+  [node-type open-delim close-delim]
+  ~(cmt
+     (capture
+       (sequence
+         (line) (column)
+         ,open-delim
+         (any :input)
+         (choice ,close-delim
+                 (error
+                   (replace (sequence (line) (column))
+                            ,|(string/format
+                                "line: %p column: %p missing %p for %p"
+                                $0 $1 close-delim node-type))))
+         (line) (column)))
+     ,|[node-type (make-attrs ;(slice $& 0 2) ;(slice $& -4 -2))
+        ;(slice $& 2 -4)]))
+
+(def loc-grammar
+  ~@{:main (sequence (line) (column)
+                     (some :input)
+                     (line) (column))
+     #
+     :input (choice :non-form
+                    :form)
+     #
+     :non-form (choice :whitespace
+                       :comment)
+     #
+     :whitespace ,(atom-node :whitespace
+                             '(choice (some (set " \0\f\t\v"))
+                                      (choice "\r\n"
+                                              "\r"
+                                              "\n")))
+     # :whitespace
+     # (cmt (capture (sequence (line) (column)
+     #                         (choice (some (set " \0\f\t\v"))
+     #                                 (choice "\r\n"
+     #                                         "\r"
+     #                                         "\n"))
+     #                         (line) (column)))
+     #      ,|[:whitespace (make-attrs ;(slice $& 0 -2)) (last $&)])
+     #
+     :comment ,(atom-node :comment
+                          '(sequence "#"
+                                     (any (if-not (set "\r\n") 1))))
+     #
+     :form (choice # reader macros
+                   :fn
+                   :quasiquote
+                   :quote
+                   :splice
+                   :unquote
+                   # collections
+                   :array
+                   :bracket-array
+                   :tuple
+                   :bracket-tuple
+                   :table
+                   :struct
+                   # atoms
+                   :number
+                   :constant
+                   :buffer
+                   :string
+                   :long-buffer
+                   :long-string
+                   :keyword
+                   :symbol)
+     #
+     :fn ,(reader-macro-node :fn "|")
+     # :fn (cmt (capture (sequence (line) (column)
+     #                             "|"
+     #                             (any :non-form)
+     #                             :form
+     #                             (line) (column)))
+     #          ,|[:fn (make-attrs ;(slice $& 0 2) ;(slice $& -4 -2))
+     #             ;(slice $& 2 -4)])
+     #
+     :quasiquote ,(reader-macro-node :quasiquote "~")
+     #
+     :quote ,(reader-macro-node :quote "'")
+     #
+     :splice ,(reader-macro-node :splice ";")
+     #
+     :unquote ,(reader-macro-node :unquote ",")
+     #
+     :array ,(collection-node :array "@(" ")")
+     # :array
+     # (cmt
+     #   (capture
+     #     (sequence
+     #       (line) (column)
+     #       "@("
+     #       (any :input)
+     #       (choice ")"
+     #               (error
+     #                 (replace (sequence (line) (column))
+     #                          ,|(string/format
+     #                              "line: %p column: %p missing %p for %p"
+     #                              $0 $1 ")" :array))))
+     #       (line) (column)))
+     #   ,|[:array (make-attrs ;(slice $& 0 2) ;(slice $& -4 -2))
+     #      ;(slice $& 2 -4)])
+     #
+     :tuple ,(collection-node :tuple "(" ")")
+     #
+     :bracket-array ,(collection-node :bracket-array "@[" "]")
+     #
+     :bracket-tuple ,(collection-node :bracket-tuple "[" "]")
+     #
+     :table ,(collection-node :table "@{" "}")
+     #
+     :struct ,(collection-node :struct "{" "}")
+     #
+     :number ,(atom-node :number
+                         ~(drop (sequence (cmt (capture (some :num-char))
+                                               ,scan-number)
+                                          (opt (sequence ":" (range "AZ" "az"))))))
+     #
+     :num-char (choice (range "09" "AZ" "az")
+                       (set "&+-._"))
+     #
+     :constant ,(atom-node :constant
+                           '(sequence (choice "false" "nil" "true")
+                                      (not :name-char)))
+     #
+     :name-char (choice (range "09" "AZ" "az" "\x80\xFF")
+                        (set "!$%&*+-./:<?=>@^_"))
+     #
+     :buffer ,(atom-node :buffer
+                         '(sequence `@"`
+                                    (any (choice :escape
+                                                 (if-not "\"" 1)))
+                                    `"`))
+     #
+     :escape (sequence "\\"
+                       (choice (set `"'0?\abefnrtvz`)
+                               (sequence "x" (2 :h))
+                               (sequence "u" (4 :h))
+                               (sequence "U" (6 :h))
+                               (error (constant "bad escape"))))
+     #
+     :string ,(atom-node :string
+                         '(sequence `"`
+                                    (any (choice :escape
+                                                 (if-not "\"" 1)))
+                                    `"`))
+     #
+     :long-string ,(atom-node :long-string
+                              :long-bytes)
+     #
+     :long-bytes {:main (drop (sequence :open
+                                        (any (if-not :close 1))
+                                        :close))
+                  :open (capture :delim :n)
+                  :delim (some "`")
+                  :close (cmt (sequence (not (look -1 "`"))
+                                        (backref :n)
+                                        (capture (backmatch :n)))
+                              ,=)}
+     #
+     :long-buffer ,(atom-node :long-buffer
+                              '(sequence "@" :long-bytes))
+     #
+     :keyword ,(atom-node :keyword
+                          '(sequence ":"
+                                     (any :name-char)))
+     #
+     :symbol ,(atom-node :symbol
+                         '(some :name-char))
+     })
+
+(comment
+
+  (get (peg/match loc-grammar " ") 2)
+  # =>
+  '(:whitespace @{:bc 1 :bl 1 :ec 2 :el 1} " ")
+
+  (get (peg/match loc-grammar "true?") 2)
+  # =>
+  '(:symbol @{:bc 1 :bl 1 :ec 6 :el 1} "true?")
+
+  (get (peg/match loc-grammar "nil?") 2)
+  # =>
+  '(:symbol @{:bc 1 :bl 1 :ec 5 :el 1} "nil?")
+
+  (get (peg/match loc-grammar "false?") 2)
+  # =>
+  '(:symbol @{:bc 1 :bl 1 :ec 7 :el 1} "false?")
+
+  (get (peg/match loc-grammar "# hi there") 2)
+  # =>
+  '(:comment @{:bc 1 :bl 1 :ec 11 :el 1} "# hi there")
+
+  (get (peg/match loc-grammar "1_000_000") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 10 :el 1} "1_000_000")
+
+  (get (peg/match loc-grammar "8.3") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 4 :el 1} "8.3")
+
+  (get (peg/match loc-grammar "1e2") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 4 :el 1} "1e2")
+
+  (get (peg/match loc-grammar "0xfe") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 5 :el 1} "0xfe")
+
+  (get (peg/match loc-grammar "2r01") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 5 :el 1} "2r01")
+
+  (get (peg/match loc-grammar "3r101&01") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 9 :el 1} "3r101&01")
+
+  (get (peg/match loc-grammar "2:u") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 4 :el 1} "2:u")
+
+  (get (peg/match loc-grammar "-8:s") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 5 :el 1} "-8:s")
+
+  (get (peg/match loc-grammar "1e2:n") 2)
+  # =>
+  '(:number @{:bc 1 :bl 1 :ec 6 :el 1} "1e2:n")
+
+  (get (peg/match loc-grammar "printf") 2)
+  # =>
+  '(:symbol @{:bc 1 :bl 1 :ec 7 :el 1} "printf")
+
+  (get (peg/match loc-grammar ":smile") 2)
+  # =>
+  '(:keyword @{:bc 1 :bl 1 :ec 7 :el 1} ":smile")
+
+  (get (peg/match loc-grammar `"fun"`) 2)
+  # =>
+  '(:string @{:bc 1 :bl 1 :ec 6 :el 1} "\"fun\"")
+
+  (get (peg/match loc-grammar "``long-fun``") 2)
+  # =>
+  '(:long-string @{:bc 1 :bl 1 :ec 13 :el 1} "``long-fun``")
+
+  (get (peg/match loc-grammar "@``long-buffer-fun``") 2)
+  # =>
+  '(:long-buffer @{:bc 1 :bl 1 :ec 21 :el 1} "@``long-buffer-fun``")
+
+  (get (peg/match loc-grammar `@"a buffer"`) 2)
+  # =>
+  '(:buffer @{:bc 1 :bl 1 :ec 12 :el 1} "@\"a buffer\"")
+
+  (get (peg/match loc-grammar "@[8]") 2)
+  # =>
+  '(:bracket-array @{:bc 1 :bl 1
+                     :ec 5 :el 1}
+                   (:number @{:bc 3 :bl 1
+                              :ec 4 :el 1} "8"))
+
+  (get (peg/match loc-grammar "@{:a 1}") 2)
+  # =>
+  '(:table @{:bc 1 :bl 1
+             :ec 8 :el 1}
+           (:keyword @{:bc 3 :bl 1
+                       :ec 5 :el 1} ":a")
+           (:whitespace @{:bc 5 :bl 1
+                          :ec 6 :el 1} " ")
+           (:number @{:bc 6 :bl 1
+                      :ec 7 :el 1} "1"))
+
+  (get (peg/match loc-grammar "~x") 2)
+  # =>
+  '(:quasiquote @{:bc 1 :bl 1
+                  :ec 3 :el 1}
+                (:symbol @{:bc 2 :bl 1
+                           :ec 3 :el 1} "x"))
+
+  )
+
+(def loc-top-level-ast
+  (put (table ;(kvs loc-grammar))
+       :main ~(sequence (line) (column)
+                        :input
+                        (line) (column))))
+
+(defn par
+  [src &opt start single]
+  (default start 0)
+  (if single
+    (if-let [[bl bc tree el ec]
+             (peg/match loc-top-level-ast src start)]
+      @[:code (make-attrs bl bc el ec) tree]
+      @[:code])
+    (if-let [captures (peg/match loc-grammar src start)]
+      (let [[bl bc] (slice captures 0 2)
+            [el ec] (slice captures -3)
+            trees (array/slice captures 2 -3)]
+        (array/insert trees 0
+                      :code (make-attrs bl bc el ec)))
+      @[:code])))
+
+# XXX: backward compatibility
+(def ast par)
+
+(comment
+
+  (par "(+ 1 1)")
+  # =>
+  '@[:code @{:bc 1 :bl 1
+             :ec 8 :el 1}
+     (:tuple @{:bc 1 :bl 1
+               :ec 8 :el 1}
+             (:symbol @{:bc 2 :bl 1
+                        :ec 3 :el 1} "+")
+             (:whitespace @{:bc 3 :bl 1
+                            :ec 4 :el 1} " ")
+             (:number @{:bc 4 :bl 1
+                        :ec 5 :el 1} "1")
+             (:whitespace @{:bc 5 :bl 1
+                            :ec 6 :el 1} " ")
+             (:number @{:bc 6 :bl 1
+                        :ec 7 :el 1} "1"))]
+
+  )
+
+(defn gen*
+  [an-ast buf]
+  (case (first an-ast)
+    :code
+    (each elt (drop 2 an-ast)
+      (gen* elt buf))
+    #
+    :buffer
+    (buffer/push-string buf (in an-ast 2))
+    :comment
+    (buffer/push-string buf (in an-ast 2))
+    :constant
+    (buffer/push-string buf (in an-ast 2))
+    :keyword
+    (buffer/push-string buf (in an-ast 2))
+    :long-buffer
+    (buffer/push-string buf (in an-ast 2))
+    :long-string
+    (buffer/push-string buf (in an-ast 2))
+    :number
+    (buffer/push-string buf (in an-ast 2))
+    :string
+    (buffer/push-string buf (in an-ast 2))
+    :symbol
+    (buffer/push-string buf (in an-ast 2))
+    :whitespace
+    (buffer/push-string buf (in an-ast 2))
+    #
+    :array
+    (do
+      (buffer/push-string buf "@(")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf))
+      (buffer/push-string buf ")"))
+    :bracket-array
+    (do
+      (buffer/push-string buf "@[")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf))
+      (buffer/push-string buf "]"))
+    :bracket-tuple
+    (do
+      (buffer/push-string buf "[")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf))
+      (buffer/push-string buf "]"))
+    :tuple
+    (do
+      (buffer/push-string buf "(")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf))
+      (buffer/push-string buf ")"))
+    :struct
+    (do
+      (buffer/push-string buf "{")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf))
+      (buffer/push-string buf "}"))
+    :table
+    (do
+      (buffer/push-string buf "@{")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf))
+      (buffer/push-string buf "}"))
+    #
+    :fn
+    (do
+      (buffer/push-string buf "|")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf)))
+    :quasiquote
+    (do
+      (buffer/push-string buf "~")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf)))
+    :quote
+    (do
+      (buffer/push-string buf "'")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf)))
+    :splice
+    (do
+      (buffer/push-string buf ";")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf)))
+    :unquote
+    (do
+      (buffer/push-string buf ",")
+      (each elt (drop 2 an-ast)
+        (gen* elt buf)))
+    ))
+
+(defn gen
+  [an-ast]
+  (let [buf @""]
+    (gen* an-ast buf)
+    # XXX: leave as buffer?
+    (string buf)))
+
+# XXX: backward compatibility
+(def code gen)
+
+(comment
+
+  (gen
+    [:code])
+  # =>
+  ""
+
+  (gen
+    '(:whitespace @{:bc 1 :bl 1
+                    :ec 2 :el 1} " "))
+  # =>
+  " "
+
+  (gen
+    '(:buffer @{:bc 1 :bl 1
+                :ec 12 :el 1} "@\"a buffer\""))
+  # =>
+  `@"a buffer"`
+
+  (gen
+    '@[:code @{:bc 1 :bl 1
+               :ec 8 :el 1}
+       (:tuple @{:bc 1 :bl 1
+                 :ec 8 :el 1}
+               (:symbol @{:bc 2 :bl 1
+                          :ec 3 :el 1} "+")
+               (:whitespace @{:bc 3 :bl 1
+                              :ec 4 :el 1} " ")
+               (:number @{:bc 4 :bl 1
+                          :ec 5 :el 1} "1")
+               (:whitespace @{:bc 5 :bl 1
+                              :ec 6 :el 1} " ")
+               (:number @{:bc 6 :bl 1
+                          :ec 7 :el 1} "1"))])
+  # =>
+  "(+ 1 1)"
+
+  )
+
+(comment
+
+  (def src "{:x  :y \n :z  [:a  :b    :c]}")
+
+  (gen (par src))
+  # =>
+  src
+
+  )
+
+(comment
+
+  (comment
+
+    (let [src (slurp (string (os/getenv "HOME")
+                             "/src/janet/src/boot/boot.janet"))]
+      (= (string src)
+         (gen (par src))))
+
+    )
+
+  )
+
+########################################################################
+
+# based on code by corasaurus-hex
+
+# `slice` doesn't necessarily preserve the input type
+
+# XXX: differs from clojure's behavior
+#      e.g. (butlast [:a]) would yield nil(?!) in clojure
+(defn s/butlast
+  [indexed]
+  (if (empty? indexed)
+    nil
+    (if (tuple? indexed)
+      (tuple/slice indexed 0 -2)
+      (array/slice indexed 0 -2))))
+
+(comment
+
+  (s/butlast @[:a :b :c])
+  # =>
+  @[:a :b]
+
+  (s/butlast [:a])
+  # =>
+  []
+
+  )
+
+(defn s/rest
+  [indexed]
+  (if (empty? indexed)
+    nil
+    (if (tuple? indexed)
+      (tuple/slice indexed 1 -1)
+      (array/slice indexed 1 -1))))
+
+(comment
+
+  (s/rest [:a :b :c])
+  # =>
+  [:b :c]
+
+  (s/rest @[:a])
+  # =>
+  @[]
+
+  )
+
+# XXX: can pass in array - will get back tuple
+(defn s/tuple-push
+  [tup x & xs]
+  (if tup
+    [;tup x ;xs]
+    [x ;xs]))
+
+(comment
+
+  (s/tuple-push [:a :b] :c)
+  # =>
+  [:a :b :c]
+
+  (s/tuple-push nil :a)
+  # =>
+  [:a]
+
+  (s/tuple-push @[] :a)
+  # =>
+  [:a]
+
+  )
+
+(defn s/to-entries
+  [val]
+  (if (dictionary? val)
+    (pairs val)
+    val))
+
+(comment
+
+  (sort (s/to-entries {:a 1 :b 2}))
+  # =>
+  @[[:a 1] [:b 2]]
+
+  (s/to-entries {})
+  # =>
+  @[]
+
+  (s/to-entries @{:a 1})
+  # =>
+  @[[:a 1]]
+
+  # XXX: leaving non-dictionaries alone and passing through...
+  #      is this desirable over erroring?
+  (s/to-entries [:a :b :c])
+  # =>
+  [:a :b :c]
+
+  )
+
+# XXX: when xs is empty, "all" becomes nil
+(defn s/first-rest-maybe-all
+  [xs]
+  (if (or (nil? xs) (empty? xs))
+    [nil nil nil]
+    [(first xs) (s/rest xs) xs]))
+
+(comment
+
+  (s/first-rest-maybe-all [:a :b])
+  # =>
+  [:a [:b] [:a :b]]
+
+  (s/first-rest-maybe-all @[:a])
+  # =>
+  [:a @[] @[:a]]
+
+  (s/first-rest-maybe-all [])
+  # =>
+  [nil nil nil]
+
+  # XXX: is this what we want?
+  (s/first-rest-maybe-all nil)
+  # =>
+  [nil nil nil]
+
+  )
+
+########################################################################
+
+(defn zipper
+  ``
+  Returns a new zipper consisting of two elements:
+
+  * `root` - the passed in root node.
+  * `state` - table of info about node's z-location in the tree with keys:
+    * `:ls` - left siblings
+    * `:pnodes` - path of nodes from root to current z-location
+    * `:pstate` - parent node's state
+    * `:rs` - right siblings
+    * `:changed?` - indicates whether "editing" has occured
+
+  `state` has a prototype table with four functions:
+
+  * :branch? - fn that tests if a node is a branch (has children)
+  * :children - fn that returns the child nodes for the given branch.
+  * :make-node - fn that takes a node + children and returns a new branch
+    node with the same.
+  * :make-state - fn for creating a new state
+  ``
+  [root &keys {:branch? branch?
+               :children children
+               :make-node make-node}]
+  #
+  (defn make-state
+    [&opt ls rs pnodes pstate changed?]
+    (table/setproto @{:ls ls
+                      :pnodes pnodes
+                      :pstate pstate
+                      :rs rs
+                      :changed? changed?}
+                    @{:branch? branch?
+                      :children children
+                      :make-node make-node
+                      :make-state make-state}))
+  #
+  [root (make-state)])
+
+(comment
+
+  # XXX
+
+  )
+
+(defn zip
+  ``
+  Returns a zipper for nested sequences (tuple/array/table/struct),
+  given a root sequence.
+  ``
+  [sequence]
+  (zipper sequence
+          :branch? |(or (dictionary? $) (indexed? $))
+          :children s/to-entries
+          :make-node (fn [p xs] xs)))
+
+(comment
+
+  (def a-node
+    [:x [:y :z]])
+
+  (def [the-node the-state]
+    (zip a-node))
+
+  the-node
+  # =>
+  a-node
+
+  # merge is used to "remove" the prototype table of `st`
+  (merge {} the-state)
+  # =>
+  @{}
+
+  )
+
+(defn node
+  "Returns the node at `zloc`."
+  [zloc]
+  (zloc 0))
+
+(comment
+
+  (node (zip [:a :b [:x :y]]))
+  # =>
+  [:a :b [:x :y]]
+
+  )
+
+(defn state
+  "Returns the state for `zloc`."
+  [zloc]
+  (zloc 1))
+
+(comment
+
+  # merge is used to "remove" the prototype table of `st`
+  (merge {}
+         (-> (zip [:a [:b [:x :y]]])
+             state))
+  # =>
+  @{}
+
+  )
+
+(defn branch?
+  ``
+  Returns true if the node at `zloc` is a branch.
+  Returns false otherwise.
+  ``
+  [zloc]
+  (((state zloc) :branch?) (node zloc)))
+
+(comment
+
+  (branch? (zip [:a :b [:x :y]]))
+  # =>
+  true
+
+  )
+
+(defn children
+  ``
+  Returns children for a branch node at `zloc`.
+  Otherwise throws an error.
+  ``
+  [zloc]
+  (if (branch? zloc)
+    (((state zloc) :children) (node zloc))
+    (error "Called `children` on a non-branch zloc")))
+
+(comment
+
+ (children (zip [:a :b [:x :y]]))
+  # =>
+  [:a :b [:x :y]]
+
+  )
+
+(defn make-state
+  ``
+  Convenience function for calling the :make-state function for `zloc`.
+  ``
+  [zloc &opt ls rs pnodes pstate changed?]
+  (((state zloc) :make-state) ls rs pnodes pstate changed?))
+
+(comment
+
+  # merge is used to "remove" the prototype table of `st`
+  (merge {}
+         (make-state (zip [:a :b [:x :y]])))
+  # =>
+  @{}
+
+  )
+
+(defn down
+  ``
+  Moves down the tree, returning the leftmost child z-location of
+  `zloc`, or nil if there are no children.
+  ``
+  [zloc]
+  (when (branch? zloc)
+    (let [[node st] zloc
+          [k rest-kids kids]
+          (s/first-rest-maybe-all (children zloc))]
+      (when kids
+        [k
+         (make-state zloc
+                     []
+                     rest-kids
+                     (if (not (empty? st))
+                       (s/tuple-push (st :pnodes) node)
+                       [node])
+                     st
+                     (st :changed?))]))))
+
+(comment
+
+  (node (down (zip [:a :b [:x :y]])))
+  # =>
+  :a
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      branch?)
+  # =>
+  false
+
+  (try
+    (-> (zip [:a])
+        down
+        children)
+    ([e] e))
+  # =>
+  "Called `children` on a non-branch zloc"
+
+  (deep=
+    #
+    (merge {}
+           (-> [:a [:b [:x :y]]]
+               zip
+               down
+               state))
+    #
+    '@{:ls ()
+       :pnodes ((:a (:b (:x :y))))
+       :pstate @{}
+       :rs ((:b (:x :y)))})
+  # =>
+  true
+
+  )
+
+(defn right
+  ``
+  Returns the z-location of the right sibling of the node
+  at `zloc`, or nil if there is no such sibling.
+  ``
+  [zloc]
+  (let [[node st] zloc
+        {:ls ls :rs rs} st
+        [r rest-rs rs] (s/first-rest-maybe-all rs)]
+    (when (and (not (empty? st)) rs)
+      [r
+       (make-state zloc
+                   (s/tuple-push ls node)
+                   rest-rs
+                   (st :pnodes)
+                   (st :pstate)
+                   (st :changed?))])))
+
+(comment
+
+  (-> (zip [:a :b])
+      down
+      right
+      node)
+  # =>
+  :b
+
+  (-> (zip [:a])
+      down
+      right)
+  # =>
+  nil
+
+  )
+
+(defn make-node
+  ``
+  Returns a branch node, given `zloc`, `node` and `children`.
+  ``
+  [zloc node children]
+  (((state zloc) :make-node) node children))
+
+(comment
+
+  (make-node (zip [:a :b [:x :y]])
+             [:a :b] [:x :y])
+  # =>
+  [:x :y]
+
+  )
+
+(defn up
+  ``
+  Moves up the tree, returning the parent z-location of `zloc`,
+  or nil if at the root z-location.
+  ``
+  [zloc]
+  (let [[node st] zloc
+        {:ls ls
+         :pnodes pnodes
+         :pstate pstate
+         :rs rs
+         :changed? changed?} st]
+    (when pnodes
+      (let [pnode (last pnodes)]
+        (if changed?
+          [(make-node zloc pnode [;ls node ;rs])
+           (make-state zloc
+                       (pstate :ls)
+                       (pstate :rs)
+                       (pstate :pnodes)
+                       (pstate :pstate)
+                       true)]
+          [pnode pstate])))))
+
+(comment
+
+  (def m-zip
+    (zip [:a :b [:x :y]]))
+
+  (deep=
+    (-> m-zip
+        down
+        up)
+    m-zip)
+  # =>
+  true
+
+  (deep=
+    (-> m-zip
+        down
+        right
+        right
+        down
+        up
+        up)
+    m-zip)
+  # =>
+  true
+
+  )
+
+# XXX: used by `root` and `df-next`
+(defn end?
+  "Returns true if `zloc` represents the end of a depth-first walk."
+  [zloc]
+  (= :end (state zloc)))
+
+(defn root
+  ``
+  Moves all the way up the tree for `zloc` and returns the node at
+  the root z-location.
+  ``
+  [zloc]
+  (if (end? zloc)
+    (node zloc)
+    (if-let [p (up zloc)]
+      (root p)
+      (node zloc))))
+
+(comment
+
+  (def a-zip
+    (zip [:a :b [:x :y]]))
+
+  (node a-zip)
+  # =>
+  (-> a-zip
+      down
+      right
+      right
+      down
+      root)
+
+  )
+
+(defn df-next
+  ``
+  Moves to the next z-location, depth-first.  When the end is
+  reached, returns a special z-location detectable via `end?`.
+  Does not move if already at the end.
+  ``
+  [zloc]
+  #
+  (defn recur
+    [loc]
+    (if (up loc)
+      (or (right (up loc))
+          (recur (up loc)))
+      [(node loc) :end]))
+  #
+  (if (end? zloc)
+    zloc
+    (or (and (branch? zloc) (down zloc))
+        (right zloc)
+        (recur zloc))))
+
+(comment
+
+  (def a-zip
+    (zip [:a :b [:x]]))
+
+  (node (df-next a-zip))
+  # =>
+  :a
+
+  (-> a-zip
+      df-next
+      df-next
+      node)
+  # =>
+  :b
+
+  (-> a-zip
+      df-next
+      df-next
+      df-next
+      df-next
+      df-next
+      end?)
+  # =>
+  true
+
+  )
+
+(defn replace
+  "Replaces existing node at `zloc` with `node`, without moving."
+  [zloc node]
+  (let [[_ st] zloc]
+    [node
+     (make-state zloc
+                 (st :ls)
+                 (st :rs)
+                 (st :pnodes)
+                 (st :pstate)
+                 true)]))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      (replace :w)
+      root)
+  # =>
+  [:w :b [:x :y]]
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      right
+      right
+      down
+      (replace :w)
+      root)
+  # =>
+  [:a :b [:w :y]]
+
+  )
+
+(defn edit
+  ``
+  Replaces the node at `zloc` with the value of `(f node args)`,
+   where `node` is the node associated with `zloc`.
+  ``
+  [zloc f & args]
+  (replace zloc
+           (apply f (node zloc) args)))
+
+(comment
+
+  (-> (zip [1 2 [8 9]])
+      down
+      (edit inc)
+      root)
+  # =>
+  [2 2 [8 9]]
+
+  )
+
+(defn insert-child
+  ``
+  Inserts `child` as the leftmost child of the node at `zloc`,
+  without moving.
+  ``
+  [zloc child]
+  (replace zloc
+           (make-node zloc
+                      (node zloc)
+                      [child ;(children zloc)])))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      (insert-child :c)
+      root)
+  # =>
+  [:c :a :b [:x :y]]
+
+  )
+
+(defn append-child
+  ``
+  Appends `child` as the rightmost child of the node at `zloc`,
+  without moving.
+  ``
+  [zloc child]
+  (replace zloc
+           (make-node zloc
+                      (node zloc)
+                      [;(children zloc) child])))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      (append-child :c)
+      root)
+  # =>
+  [:a :b [:x :y] :c]
+
+  )
+
+(defn rightmost
+  ``
+  Returns the z-location of the rightmost sibling of the node at
+  `zloc`, or the current node's z-location if there are none to the
+  right.
+  ``
+  [zloc]
+  (let [[node st] zloc
+        {:ls ls :rs rs} st]
+    (if (and (not (empty? st))
+             (indexed? rs)
+             (not (empty? rs)))
+      [(last rs)
+       (make-state zloc
+                   (s/tuple-push ls node ;(s/butlast rs))
+                   []
+                   (st :pnodes)
+                   (st :pstate)
+                   (st :changed?))]
+      zloc)))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      rightmost
+      node)
+  # =>
+  [:x :y]
+
+  )
+
+(defn remove
+  ``
+  Removes the node at `zloc`, returning the z-location that would have
+  preceded it in a depth-first walk.
+  Throws an error if called at the root z-location.
+  ``
+  [zloc]
+  (let [[node st] zloc
+        {:ls ls
+         :pnodes pnodes
+         :pstate pstate
+         :rs rs} st]
+    #
+    (defn recur
+      [a-zloc]
+      (if-let [child (and (branch? a-zloc) (down a-zloc))]
+        (recur (rightmost child))
+        a-zloc))
+    #
+    (if (not (empty? st))
+      (if (pos? (length ls))
+        (recur [(last ls)
+                (make-state zloc
+                            (s/butlast ls)
+                            rs
+                            pnodes
+                            pstate
+                            true)])
+        [(make-node zloc (last pnodes) rs)
+         (make-state zloc
+                     (pstate :ls)
+                     (pstate :rs)
+                     (pstate :pnodes)
+                     (pstate :pstate)
+                     true)])
+      (error "Called `remove` at root"))))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      right
+      remove
+      node)
+  # =>
+  :a
+
+  (try
+    (remove (zip [:a :b [:x :y]]))
+    ([e] e))
+  # =>
+  "Called `remove` at root"
+
+  )
+
+(defn left
+  ``
+  Returns the z-location of the left sibling of the node
+  at `zloc`, or nil if there is no such sibling.
+  ``
+  [zloc]
+  (let [[node st] zloc
+        {:ls ls :rs rs} st]
+    (when (and (not (empty? st))
+               (indexed? ls)
+               (not (empty? ls)))
+      [(last ls)
+       (make-state zloc
+                   (s/butlast ls)
+                   [node ;rs]
+                   (st :pnodes)
+                   (st :pstate)
+                   (st :changed?))])))
+
+(comment
+
+  (-> (zip [:a :b :c])
+      down
+      right
+      right
+      left
+      node)
+  # =>
+  :b
+
+  (-> (zip [:a])
+      down
+      left)
+  # =>
+  nil
+
+  )
+
+(defn df-prev
+  ``
+  Moves to the previous z-location, depth-first.
+  If already at the root, returns nil.
+  ``
+  [zloc]
+  #
+  (defn recur
+    [a-zloc]
+    (if-let [child (and (branch? a-zloc)
+                        (down a-zloc))]
+      (recur (rightmost child))
+      a-zloc))
+  #
+  (if-let [left-loc (left zloc)]
+    (recur left-loc)
+    (up zloc)))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      right
+      df-prev
+      node)
+  # =>
+  :a
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      right
+      right
+      down
+      df-prev
+      node)
+  # =>
+  [:x :y]
+
+  )
+
+(defn insert-right
+  ``
+  Inserts `a-node` as the right sibling of the node at `zloc`,
+  without moving.
+  ``
+  [zloc a-node]
+  (let [[node st] zloc
+        {:ls ls :rs rs} st]
+    (if (not (empty? st))
+      [node
+       (make-state zloc
+                   ls
+                   [a-node ;rs]
+                   (st :pnodes)
+                   (st :pstate)
+                   true)]
+      (error "Called `insert-right` at root"))))
+
+(comment
+
+  (def a-zip
+    (zip [:a :b [:x :y]]))
+
+  (-> a-zip
+      down
+      (insert-right :z)
+      root)
+  # =>
+  [:a :z :b [:x :y]]
+
+  (try
+    (insert-right a-zip :e)
+    ([e] e))
+  # =>
+  "Called `insert-right` at root"
+
+  )
+
+(defn insert-left
+  ``
+  Inserts `a-node` as the left sibling of the node at `zloc`,
+  without moving.
+  ``
+  [zloc a-node]
+  (let [[node st] zloc
+        {:ls ls :rs rs} st]
+    (if (not (empty? st))
+      [node
+       (make-state zloc
+                   (s/tuple-push ls a-node)
+                   rs
+                   (st :pnodes)
+                   (st :pstate)
+                   true)]
+      (error "Called `insert-left` at root"))))
+
+(comment
+
+  (def a-zip
+    (zip [:a :b [:x :y]]))
+
+  (-> a-zip
+      down
+      (insert-left :z)
+      root)
+  # =>
+  [:z :a :b [:x :y]]
+
+  (try
+    (insert-left a-zip :e)
+    ([e] e))
+  # =>
+  "Called `insert-left` at root"
+
+  )
+
+(defn rights
+  "Returns siblings to the right of `zloc`."
+  [zloc]
+  (when-let [st (state zloc)]
+    (st :rs)))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      rights)
+  # =>
+  [:b [:x :y]]
+
+  )
+
+(defn lefts
+  "Returns siblings to the left of `zloc`."
+  [zloc]
+  (if-let [st (state zloc)
+           ls (st :ls)]
+    ls
+    []))
+
+(comment
+
+  (-> (zip [:a :b])
+      down
+      lefts)
+  # =>
+  []
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      right
+      right
+      lefts)
+  # =>
+  [:a :b]
+
+  )
+
+(defn leftmost
+  ``
+  Returns the z-location of the leftmost sibling of the node at `zloc`,
+  or the current node's z-location if there are no siblings to the left.
+  ``
+  [zloc]
+  (let [[node st] zloc
+        {:ls ls :rs rs} st]
+    (if (and (not (empty? st))
+             (indexed? ls)
+             (not (empty? ls)))
+      [(first ls)
+       (make-state zloc
+                   []
+                   [;(s/rest ls) node ;rs]
+                   (st :pnodes)
+                   (st :pstate)
+                   (st :changed?))]
+      zloc)))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      leftmost
+      node)
+  # =>
+  :a
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      rightmost
+      leftmost
+      node)
+  # =>
+  :a
+
+  )
+
+(defn path
+  "Returns the path of nodes that lead to `zloc` from the root node."
+  [zloc]
+  (when-let [st (state zloc)]
+    (st :pnodes)))
+
+(comment
+
+  (path (zip [:a :b [:x :y]]))
+  # =>
+  nil
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      path)
+  # =>
+  [[:a :b [:x :y]]]
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      right
+      right
+      down
+      path)
+  # =>
+  [[:a :b [:x :y]] [:x :y]]
+
+ )
+
+(defn right-until
+  ``
+  Try to move right from `zloc`, calling `pred` for each
+  right sibling.  If the `pred` call has a truthy result,
+  return the corresponding right sibling.
+  Otherwise, return nil.
+  ``
+  [zloc pred]
+  (when-let [right-sib (right zloc)]
+    (if (pred right-sib)
+      right-sib
+      (right-until right-sib pred))))
+
+(comment
+
+  (-> [:code
+       [:tuple
+        [:comment "# hi there"] [:whitespace "\n"]
+        [:symbol "+"] [:whitespace " "]
+        [:number "1"] [:whitespace " "]
+        [:number "2"]]]
+      zip
+      down
+      right
+      down
+      (right-until |(match (node $)
+                      [:comment]
+                      false
+                      #
+                      [:whitespace]
+                      false
+                      #
+                      true))
+      node)
+  # =>
+  [:symbol "+"]
+
+  )
+
+(defn left-until
+  ``
+  Try to move left from `zloc`, calling `pred` for each
+  left sibling.  If the `pred` call has a truthy result,
+  return the corresponding left sibling.
+  Otherwise, return nil.
+  ``
+  [zloc pred]
+  (when-let [left-sib (left zloc)]
+    (if (pred left-sib)
+      left-sib
+      (left-until left-sib pred))))
+
+(comment
+
+  (-> [:code
+       [:tuple
+        [:comment "# hi there"] [:whitespace "\n"]
+        [:symbol "+"] [:whitespace " "]
+        [:number "1"] [:whitespace " "]
+        [:number "2"]]]
+      zip
+      down
+      right
+      down
+      rightmost
+      (left-until |(match (node $)
+                      [:comment]
+                      false
+                      #
+                      [:whitespace]
+                      false
+                      #
+                      true))
+      node)
+  # =>
+  [:number "1"]
+
+  )
+
+(defn search-from
+  ``
+  Successively call `pred` on z-locations starting at `zloc`
+  in depth-first order.  If a call to `pred` returns a
+  truthy value, return the corresponding z-location.
+  Otherwise, return nil.
+  ``
+  [zloc pred]
+  (if (pred zloc)
+    zloc
+    (when-let [next-zloc (df-next zloc)]
+      (when (end? next-zloc)
+        (break nil))
+      (search-from next-zloc pred))))
+
+(comment
+
+  (-> (zip [:a :b :c])
+      down
+      (search-from |(match (node $)
+                      :b
+                      true))
+      node)
+  # =>
+  :b
+
+  (-> (zip [:a :b :c])
+      down
+      (search-from |(match (node $)
+                      :d
+                      true)))
+  # =>
+  nil
+
+  (-> (zip [:a :b :c])
+      down
+      (search-from |(match (node $)
+                      :a
+                      true))
+      node)
+  # =>
+  :a
+
+  )
+
+(defn search-after
+  ``
+  Successively call `pred` on z-locations starting after
+  `zloc` in depth-first order.  If a call to `pred` returns a
+  truthy value, return the corresponding z-location.
+  Otherwise, return nil.
+  ``
+  [zloc pred]
+  (when (end? zloc)
+    (break nil))
+  (when-let [next-zloc (df-next zloc)]
+    (if (pred next-zloc)
+      next-zloc
+      (search-after next-zloc pred))))
+
+(comment
+
+  (-> (zip [:b :a :b])
+      down
+      (search-after |(match (node $)
+                       :b
+                       true))
+      left
+      node)
+  # =>
+  :a
+
+  (-> (zip [:b :a :b])
+      down
+      (search-after |(match (node $)
+                       :d
+                       true)))
+  # =>
+  nil
+
+  (-> (zip [:a [:b :c [2 [3 :smile] 5]]])
+      (search-after |(match (node $)
+                       [_ :smile]
+                       true))
+      down
+      node)
+  # =>
+  3
+
+  )
+
+(defn unwrap
+  ``
+  If the node at `zloc` is a branch node, "unwrap" its children in
+  place.  If `zloc`'s node is not a branch node, do nothing.
+
+  Throws an error if `zloc` corresponds to a top-most container.
+  ``
+  [zloc]
+  (unless (branch? zloc)
+    (break zloc))
+  #
+  (when (empty? (state zloc))
+    (error "Called `unwrap` at root"))
+  #
+  (def kids (children zloc))
+  (var i (dec (length kids)))
+  (var curr-zloc zloc)
+  (while (<= 0 i) # right to left
+    (set curr-zloc
+         (insert-right curr-zloc (get kids i)))
+    (-- i))
+  # try to end up at a sensible spot
+  (set curr-zloc
+       (remove curr-zloc))
+  (if-let [ret-zloc (right curr-zloc)]
+    ret-zloc
+    curr-zloc))
+
+(comment
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      right
+      right
+      unwrap
+      root)
+  # =>
+  [:a :b :x :y]
+
+  (-> (zip [:a :b [:x :y]])
+      down
+      unwrap
+      root)
+  # =>
+  [:a :b [:x :y]]
+
+  (-> (zip [[:a]])
+      down
+      unwrap
+      root)
+  # =>
+  [:a]
+
+  (-> (zip [[:a :b] [:x :y]])
+      down
+      down
+      remove
+      unwrap
+      root)
+  # =>
+  [:b [:x :y]]
+
+  (try
+    (-> (zip [:a :b [:x :y]])
+        unwrap)
+    ([e] e))
+  # =>
+  "Called `unwrap` at root"
+
+  )
+
+(defn wrap
+  ``
+  Replace nodes from `start-zloc` through `end-zloc` with a single
+  node of the same type as `wrap-node` containing the nodes from
+  `start-zloc` through `end-zloc`.
+
+  If `end-zloc` is not specified, just wrap `start-zloc`.
+
+  The caller is responsible for ensuring the value of `end-zloc`
+  is somewhere to the right of `start-zloc`.  Throws an error if
+  an inappropriate value is specified for `end-zloc`.
+  ``
+  [start-zloc wrap-node &opt end-zloc]
+  (default end-zloc start-zloc)
+  #
+  # 1. collect all nodes to wrap
+  #
+  (def kids @[])
+  (var cur-zloc start-zloc)
+  (while (and cur-zloc
+              # XXX: expensive?
+              (not (deep= (node cur-zloc)
+                          (node end-zloc)))) # left to right
+    (array/push kids (node cur-zloc))
+    (set cur-zloc (right cur-zloc)))
+  (when (nil? cur-zloc)
+    (error "Called `wrap` with invalid value for `end-zloc`."))
+  # also collect the last node
+  (array/push kids (node end-zloc))
+  #
+  # 2. replace locations that will be removed with non-container nodes
+  #
+  (def dummy-node
+    (make-node start-zloc wrap-node (tuple)))
+  (set cur-zloc start-zloc)
+  # trying to do this together in step 1 is not straight-forward
+  # because the desired exiting condition for the while loop depends
+  # on cur-zloc becoming end-zloc -- if `replace` were to be used
+  # there, the termination condition never gets fulfilled properly.
+  (for i 0 (dec (length kids)) # left to right again
+    (set cur-zloc
+         (-> (replace cur-zloc dummy-node)
+             right)))
+  (set cur-zloc
+       (replace cur-zloc dummy-node))
+  #
+  # 3. remove all relevant locations
+  #
+  (def new-node
+    (make-node start-zloc wrap-node (tuple ;kids)))
+  (for i 0 (dec (length kids)) # right to left
+    (set cur-zloc
+         (remove cur-zloc)))
+  # 4. put the new container node into place
+  (replace cur-zloc new-node))
+
+(comment
+
+  (def start-zloc
+    (-> (zip [:a [:b] :c :x])
+        down
+        right))
+
+  (node start-zloc)
+  # =>
+  [:b]
+
+  (-> (wrap start-zloc [])
+      root)
+  # =>
+  [:a [[:b]] :c :x]
+
+  (def end-zloc
+    (right start-zloc))
+
+  (node end-zloc)
+  # =>
+  :c
+
+  (-> (wrap start-zloc [] end-zloc)
+      root)
+  # =>
+  [:a [[:b] :c] :x]
+
+  (try
+    (-> (wrap end-zloc [] start-zloc)
+        root)
+    ([e] e))
+  # =>
+  "Called `wrap` with invalid value for `end-zloc`."
+
+  )
+
+########################################################################
+
+(defn has-children?
+  ``
+  Returns true if `node` can have children.
+  Returns false if `node` cannot have children.
+  ``
+  [a-node]
+  (when-let [[head] a-node]
+    (truthy? (get {:code true
+                   :fn true
+                   :quasiquote true
+                   :quote true
+                   :splice true
+                   :unquote true
+                   :array true
+                   :tuple true
+                   :bracket-array true
+                   :bracket-tuple true
+                   :table true
+                   :struct true}
+                  head))))
+
+(comment
+
+  (has-children?
+    [:tuple @{}
+     [:symbol @{} "+"] [:whitespace @{} " "]
+     [:number @{} "1"] [:whitespace @{} " "]
+     [:number @{} "2"]])
+  # =>
+  true
+
+  (has-children? [:number @{} "8"])
+  # =>
+  false
+
+  )
+
+(defn zip
+  ``
+  Returns a zipper location (zloc or z-location) for a tree
+  representing Janet code.
+  ``
+  [tree]
+  (defn branch?
+    [a-node]
+    (truthy? (and (indexed? a-node)
+                  (not (empty? a-node))
+                  (has-children? a-node))))
+  #
+  (defn children
+    [a-node]
+    (if (branch? a-node)
+      (slice a-node 2)
+      (error "Called `children` on a non-branch node")))
+  #
+  (defn make-node
+    [a-node children]
+    [(first a-node) @{} ;children])
+  #
+  (zipper tree
+            :branch? branch?
+            :children children
+            :make-node make-node))
+
+(comment
+
+  (def root-node
+    @[:code @{} [:number @{} "8"]])
+
+  (def [the-node the-state]
+    (zip root-node))
+
+  the-node
+  # =>
+  root-node
+
+  (merge {} the-state)
+  # =>
+  @{}
+
+  )
+
+(defn attrs
+  ``
+  Return the attributes table for the node of a z-location.  The
+  attributes table contains at least bounds of the node by 1-based line
+  and column numbers.
+  ``
+  [zloc]
+  (get (node zloc) 1))
+
+(comment
+
+  (-> (par "(+ 1 3)")
+      zip
+      down
+      attrs)
+  # =>
+  @{:bc 1 :bl 1 :ec 8 :el 1}
+
+  )
+
+(defn zip-down
+  ``
+  Convenience function that returns a zipper which has
+  already had `down` called on it.
+  ``
+  [tree]
+  (-> (zip tree)
+      down))
+
+(comment
+
+  (-> (par "(+ 1 3)")
+      zip-down
+      node)
+  # =>
+  '(:tuple @{:bc 1 :bl 1
+             :ec 8 :el 1}
+           (:symbol @{:bc 2 :bl 1
+                      :ec 3 :el 1} "+")
+           (:whitespace @{:bc 3 :bl 1
+                          :ec 4 :el 1} " ")
+           (:number @{:bc 4 :bl 1
+                      :ec 5 :el 1} "1")
+           (:whitespace @{:bc 5 :bl 1
+                          :ec 6 :el 1} " ")
+           (:number @{:bc 6 :bl 1
+                      :ec 7 :el 1} "3"))
+
+  )
+
+# wsc == whitespace, comment
+(defn right-skip-wsc
+  ``
+  Try to move right from `zloc`, skipping over whitespace
+  and comment nodes.
+
+  When at least one right move succeeds, return the z-location
+  for the last successful right move destination.  Otherwise,
+  return nil.
+  ``
+  [zloc]
+  (right-until zloc
+                 |(match (node $)
+                    [:whitespace]
+                    false
+                    #
+                    [:comment]
+                    false
+                    #
+                    true)))
+
+(comment
+
+  (-> (par
+        ``
+        (# hi there
+        + 1 2)
+        ``)
+      zip-down
+      down
+      right-skip-wsc
+      node)
+  # =>
+  [:symbol @{:bc 1 :bl 2 :ec 2 :el 2} "+"]
+
+  (-> (par "(:a)")
+      zip-down
+      down
+      right-skip-wsc)
+  # =>
+  nil
+
+  )
+
+(defn left-skip-wsc
+  ``
+  Try to move left from `zloc`, skipping over whitespace
+  and comment nodes.
+
+  When at least one left move succeeds, return the z-location
+  for the last successful left move destination.  Otherwise,
+  return nil.
+  ``
+  [zloc]
+  (left-until zloc
+                |(match (node $)
+                   [:whitespace]
+                   false
+                   #
+                   [:comment]
+                   false
+                   #
+                   true)))
+
+(comment
+
+  (-> (par
+        ``
+        (# hi there
+        + 1 2)
+        ``)
+      zip-down
+      down
+      right-skip-wsc
+      right-skip-wsc
+      left-skip-wsc
+      node)
+  # =>
+  [:symbol @{:bc 1 :bl 2 :ec 2 :el 2} "+"]
+
+  (-> (par "(:a)")
+      zip-down
+      down
+      left-skip-wsc)
+  # =>
+  nil
+
+  )
+
+########################################################################
+
+# XXX: doesn't handle atypical code that uses ordinary tuples for
+#      parameter lists
+(defn find-caller-docstring
+  [zloc]
+  (var cur-zloc zloc)
+  (var ret nil)
+  (set cur-zloc (right-until cur-zloc |(match (node $)
+                                           [:bracket-tuple]
+                                           $)))
+  (when cur-zloc
+    (def params-node (node cur-zloc))
+    (while (def left-zloc (left cur-zloc))
+      (set cur-zloc left-zloc)
+      (when-let [[node-type {:bl bl :bc bc} node-value]
+                 (node left-zloc)]
+        (when (get {:string 1 :long-string 1} node-type)
+          (set ret @{:bl bl :bc bc :text node-value
+                     :params-str (gen params-node)})
+          (break))))
+    #
+    ret))
+
+# XXX: only called when parsed parent has length = 3
+(defn find-defdyn-docstring
+  [zloc]
+  (var cur-zloc zloc)
+  (var ret nil)
+  # start at the rightmost end
+  (set cur-zloc (rightmost cur-zloc))
+  (when cur-zloc
+    (while cur-zloc
+      (when-let [[node-type {:bl bl :bc bc} node-value]
+                 (node cur-zloc)]
+        (when (get {:string 1 :long-string 1} node-type)
+          (set ret @{:bl bl :bc bc :text node-value})
+          (break)))
+      #
+      (set cur-zloc (left cur-zloc)))
+    #
+    ret))
+
+# XXX: only called when parsed parent has length >= 4
+(defn find-special-docstring
+  [zloc]
+  (var cur-zloc zloc)
+  (var ret nil)
+  # start at the rightmost end
+  (set cur-zloc (rightmost cur-zloc))
+  (when cur-zloc
+    # cannot be the rightmost node
+    (while (def left-zloc (left cur-zloc))
+      (when-let [[node-type {:bl bl :bc bc} node-value]
+                 (node left-zloc)]
+        (when (get {:string 1 :long-string 1} node-type)
+          (set ret @{:bl bl :bc bc :text node-value})
+          (break)))
+      #
+      (set cur-zloc left-zloc))
+    #
+    ret))
+
+# XXX: if the keys were strings then other code would need to
+#      change...
+(def func-definers
+  {'defn 1 'defn- 1})
+
+(def macro-definers
+  {'defmacro 1 'defmacro- 1})
+
+(def call-definers
+  (merge func-definers macro-definers))
+
+(def special-definers
+  {'def 1 'def- 1
+   'var 1 'var- 1})
+
+(defn find-doc-of
+  [src opts]
+  (def {:name name} opts)
+  #
+  (def tree (par src))
+  (var cur-zloc (zip-down tree))
+  (def results @[])
+  #
+  (while (def next-zloc
+           (search-from cur-zloc
+                          |(match (node $)
+                             [:symbol _ (@ name)]
+                             $)))
+    (def parent-zloc (up next-zloc))
+    (when (= :tuple (get (node parent-zloc) 0))
+      (def node (node parent-zloc))
+      (def raw-code-str (gen node))
+      (def parsed
+        (try
+          (parse raw-code-str)
+          ([e]
+            (eprintf "failed to parse: %s" raw-code-str))))
+      (when (and parsed (= name (string (get parsed 1))))
+        (def head (first parsed))
+        (cond
+          (and (get special-definers head)
+               (<= 4 (length parsed))) # metadata possible
+          (when-let [ds-tbl (find-special-docstring (down parent-zloc))]
+            (array/push results
+                        (merge ds-tbl {:def-type (string head)})))
+          #
+          (get call-definers head)
+          (when-let [ds-tbl (find-caller-docstring (down parent-zloc))]
+            (array/push results
+                        (merge ds-tbl {:def-type (string head)})))
+          #
+          (and (= 'defdyn head) (= 3 (length parsed)))
+          (when-let [ds-tbl (find-defdyn-docstring (down parent-zloc))]
+            (array/push results
+                        (merge ds-tbl {:def-type (string head)})))
+          # XXX: other cases?
+          nil)))
+    #
+    (set cur-zloc (df-next next-zloc)))
+  #
+  results)
+
+(comment
+
+  (find-doc-of
+    ``
+    (defn smile
+      "I am a defn docstring."
+      [y]
+      (pp y))
+
+    (defn- smile
+      "I am a defn- docstring."
+      [z]
+      (pp [:z z]))
+    ``
+    {:name "smile"})
+  # =>
+  @[@{:bc 3 :bl 2
+      :def-type "defn"
+      :text `"I am a defn docstring."`
+      :params-str "[y]"}
+    @{:bc 3 :bl 7
+      :def-type "defn-"
+      :text `"I am a defn- docstring."`
+      :params-str "[z]"}]
+
+  (find-doc-of
+    ``
+    (var smile "a docstring" {:a 2})
+
+    (var- smile "woohoo" "hello")
+    ``
+    {:name "smile"})
+  # =>
+  @[@{:bc 12 :bl 1
+      :def-type "var"
+      :text `"a docstring"`}
+    @{:bc 13 :bl 3
+      :def-type "var-"
+      :text `"woohoo"`}]
+
+  (find-doc-of
+    ``
+    (defdyn *smile*)
+
+    (defdyn *smile* "smiling docstring")
+    ``
+    {:name "*smile*"})
+  # =>
+  @[@{:bc 17 :bl 3
+      :def-type "defdyn"
+      :text `"smiling docstring"`}]
+
+  (find-doc-of
+    ```
+    (defmacro as-macro
+      ``Use a function or macro literal `f` as a macro. This lets
+      any function be used as a macro. Inside a quasiquote, the
+      idiom `(as-macro ,my-custom-macro arg1 arg2...)` can be used
+      to avoid unwanted variable capture of `my-custom-macro`.``
+      [f & args]
+      (f ;args))
+    ```
+    {:name "as-macro"})
+
+  # =>
+  @[@{:bc 3 :bl 2
+      :def-type "defmacro"
+      :text
+      (string
+        "``Use a function or macro literal `f` as a macro. This lets\n"
+        "  any function be used as a macro. Inside a quasiquote, the\n"
+        "  idiom `(as-macro ,my-custom-macro arg1 arg2...)` can be used\n"
+        "  to avoid unwanted variable capture of `my-custom-macro`.``")
+      :params-str "[f & args]"}]
+
+  (find-doc-of
+    ``
+    (def smile "a docstring" 1)
+
+    (defn smile
+      "I am a docstring."
+      [y]
+      (pp y))
+    ``
+    {:name "smile"})
+  # =>
+  @[@{:bc 12 :bl 1
+      :def-type "def"
+      :text `"a docstring"`}
+    @{:bc 3 :bl 4
+      :def-type "defn"
+      :text `"I am a docstring."`
+      :params-str "[y]"}]
+
+  )
+
+(defn find-docs
+  [src &opt opts]
+  (default opts {})
+  (def {:pred pred} opts)
+  #
+  (def tree (par src))
+  (var cur-zloc (zip-down tree))
+  (def results @[])
+  #
+  (while (def next-zloc
+           (search-from cur-zloc
+                          |(match (node $)
+                             [:tuple]
+                             $)))
+    (def node (node next-zloc))
+    (def raw-code-str (gen node))
+    (def parsed
+      (try
+        (parse raw-code-str)
+        ([e]
+          (eprintf "failed to parse: %s" raw-code-str))))
+    (when (and parsed
+               (if-not pred true (pred parsed)))
+      (when-let [head (first parsed)]
+        (when (symbol? head)
+          (def name (string (get parsed 1)))
+          (cond
+            (and (get special-definers head)
+                 (<= 4 (length parsed))) # metadata possible
+            (when-let [ds-tbl (find-special-docstring (down next-zloc))]
+              (array/push results
+                          (merge ds-tbl {:def-type (string head)
+                                         :name name})))
+            #
+            (get call-definers head)
+            (when-let [ds-tbl (find-caller-docstring (down next-zloc))]
+            (array/push results
+                        (merge ds-tbl {:def-type (string head)
+                                       :name name})))
+            #
+            (and (= 'defdyn head) (= 3 (length parsed)))
+            (when-let [ds-tbl (find-defdyn-docstring (down next-zloc))]
+              (array/push results
+                          (merge ds-tbl {:def-type (string head)
+                                         :name name})))
+            # XXX: other cases?
+            nil))))
+    #
+    (set cur-zloc (df-next next-zloc)))
+  #
+  results)
+
+(comment
+
+  (find-docs
+    ``
+    (defn smile
+      "I am a defn docstring."
+      [y]
+      (pp y))
+
+    (defn- smile
+      "I am a defn- docstring."
+      [z]
+      (pp [:z z]))
+    ``)
+  # =>
+  @[@{:bc 3 :bl 2
+      :def-type "defn"
+      :name "smile"
+      :text `"I am a defn docstring."`
+      :params-str "[y]"}
+    @{:bc 3 :bl 7
+      :def-type "defn-"
+      :name "smile"
+      :text `"I am a defn- docstring."`
+      :params-str "[z]"}]
+
+  (find-docs
+    ``
+    (var smile "a docstring" {:a 2})
+
+    (var- smile "woohoo" "hello")
+    ``)
+  # =>
+  @[@{:bc 12 :bl 1
+      :def-type "var"
+      :name "smile"
+      :text `"a docstring"`}
+    @{:bc 13 :bl 3
+      :def-type "var-"
+      :name "smile"
+      :text `"woohoo"`}]
+
+  (find-docs
+    ``
+    (defdyn *smile*)
+
+    (defdyn *smile* "smiling docstring")
+    ``)
+  # =>
+  @[@{:bc 17 :bl 3
+      :def-type "defdyn"
+      :name "*smile*"
+      :text `"smiling docstring"`}]
+
+  (find-docs
+    ```
+    (defmacro as-macro
+      ``Use a function or macro literal `f` as a macro. This lets
+      any function be used as a macro. Inside a quasiquote, the
+      idiom `(as-macro ,my-custom-macro arg1 arg2...)` can be used
+      to avoid unwanted variable capture of `my-custom-macro`.``
+      [f & args]
+      (f ;args))
+    ```)
+  # =>
+  @[@{:bc 3 :bl 2
+      :def-type "defmacro"
+      :name "as-macro"
+      :text
+      (string
+        "``Use a function or macro literal `f` as a macro. This lets\n"
+        "  any function be used as a macro. Inside a quasiquote, the\n"
+        "  idiom `(as-macro ,my-custom-macro arg1 arg2...)` can be used\n"
+        "  to avoid unwanted variable capture of `my-custom-macro`.``")
+      :params-str "[f & args]"}]
+
+  (find-docs
+    ``
+    (def smile "a docstring" 1)
+
+    (defn smile
+      "I am a docstring."
+      [y]
+      (pp y))
+    ``)
+  # =>
+  @[@{:bc 12 :bl 1
+      :def-type "def"
+      :name "smile"
+      :text `"a docstring"`}
+    @{:bc 3 :bl 4
+      :def-type "defn"
+      :name "smile"
+      :text `"I am a docstring."`
+      :params-str "[y]"}]
+
+  )
+
+########################################################################
+
+(defn massage-param-str
+  [in-str]
+  (peg/replace-all ~(some (choice " " "\r" "\n"))
+                   " " in-str))
+
+(comment
+
+  (massage-param-str
+    (string "root &keys {:branch? branch?\n"
+            "    :children children\n"
+            "        :make-node make-node}"))
+  # =>
+  (buffer "root &keys {:branch? branch? "
+          ":children children "
+          ":make-node make-node}")
+
+  )
+
+(def janet-indent
+  "Default indentation that the built-in `doc-format` uses."
+  4)
+
+# XXX: this only works for no indentation
+(def indent-ws "")
+
+(defn dedent
+  [region &opt amount]
+  (default amount janet-indent)
+  (def d-lines
+    (->> (string/split "\n" region)
+         (map |(if (<= amount (length $))
+                 (string/slice $ amount)
+                 $))))
+  (string/join d-lines "\n"))
+
+(comment
+
+  (dedent (string "    line one\n"
+                  "    line two\n"
+                  "    line three")
+          4)
+  # =>
+  (string "line one\n"
+          "line two\n"
+          "line three")
+
+  )
+
+(defn make-line-1
+  [def-type]
+  (def key (symbol def-type))
+  (cond
+    (get special-definers key)
+    (string/format "%svalue (%s)" indent-ws def-type)
+    #
+    (get func-definers key)
+    (string/format "%sfunction (%s)" indent-ws def-type)
+    #
+    (get macro-definers key)
+    (string/format "%smacro (%s)" indent-ws def-type)
+    #
+    (= "defdyn" def-type)
+    (string/format "%sdynamic variable" indent-ws)
+    #
+    (errorf "unknown def-type: %n" def-type)))
+
+(defn search-and-report
+  [opts]
+  (def {:query-fn query-fn
+        :name name} opts)
+  #
+  (def [all-results _] (search-paths query-fn opts))
+  (when (zero? (length all-results))
+    (break false))
+  #
+  (print)
+  (each r all-results
+    (def {:path path :bl line-no :bc col-no
+          :def-type def-type :text pre-str
+          :params-str params-str} r)
+    (def line-1 (make-line-1 def-type))
+    (def line-2 (string/format "%s%s on line %d, column %d"
+                               indent-ws path line-no col-no))
+    (def name (if name name (get r :name)))
+    (def usage
+      (if-not (get r :params-str)
+        name
+        (let [# ensure string is one line
+              line-str (massage-param-str params-str)
+              # drop surrounding delimiters
+              inner-str (string/slice line-str 1 -2)]
+          (string/format "(%s %s)" name inner-str))))
+    (def leading-ws (string/repeat " " (dec col-no)))
+    (def doc-str
+      (string/format "%s\n\n%s" usage
+                     # sometimes long-string dedenting is needed, so
+                     # prepend proper amount of whitespace
+                     (parse (string leading-ws pre-str))))
+    (def bottom
+      (string/format "%s%s"
+                     indent-ws
+                     (dedent (string/trim (doc-format doc-str) "\n"))))
+    (def fmt (string "%s\n"
+                     "%s\n"
+                     "\n"
+                     "%s\n"))
+    (printf fmt line-1 line-2 bottom)
+    # XXX: 72 = 80 - 8 (from janet's `boot.janet`)
+    (def width (- (- (dyn :doc-width 80) 8)
+                  janet-indent))
+    (printf (string/repeat "-" width))
+    (print))
+  #
+  all-results)
+
+########################################################################
 
 (defn escape
   [name]
@@ -93,60 +2785,205 @@
 
 ########################################################################
 
+(defn do-all-docs
+  [opts]
+  (def {:rest the-args} opts)
+  #
+  (def includes the-args)
+  # find .janet files
+  (def src-filepaths
+    (collect-paths includes |(string/has-suffix? ".janet" $)))
+  #
+  (search-and-report {:query-fn find-docs
+                      :paths src-filepaths}))
+
+(defn do-doc-of
+  [opts]
+  (def {:rest the-args} opts)
+  #
+  (def name (get the-args 0))
+  (array/remove the-args 0)
+  #
+  (def includes the-args)
+  # find .janet files
+  (def src-filepaths
+    (collect-paths includes |(string/has-suffix? ".janet" $)))
+  #
+  (search-and-report {:query-fn find-doc-of
+                      :paths src-filepaths :name name}))
+
+########################################################################
+
+(def not-found-message "Nothing found")
+
+(defn is-index?
+  [doc-buf]
+  (when (not (string/has-prefix? "Bindings:" (string/trim doc-buf)))
+    (break false))
+  #
+  (def parts (->> (string/trim doc-buf)
+                  (string/split "\n\n")
+                  (map string/trim)
+                  (filter |(not (empty? $)))))
+  # remove the trailing text "Use (doc sym)..."
+  (array/pop parts)
+  #
+  (assertf (= "Bindings:" (get parts 0))
+           `expected "Bindings:" but got: %n for: %n`
+           (get parts 0) doc-buf)
+  (array/remove parts 0)
+  (def bindings
+    (let [target (get parts 0)]
+      (if (= "Dynamics:" target)
+        @[]
+        (let [bz (->> (string/replace-all "\n" " " target)
+                      (string/split " ")
+                      (filter |(not (empty? $))))]
+          (array/remove parts 0)
+          bz))))
+  # next thing is "Dynamics:", remove it
+  (array/remove parts 0)
+  #
+  (def dynamics
+    (let [target (get parts 0)]
+      (cond
+        (not target)
+        @[]
+        (defer (array/remove parts 0)
+          (->> (string/replace-all "\n" " " target)
+               (string/split " ")
+               (filter |(not (empty? $))))))))
+  #
+  [bindings dynamics])
+
+# doc and doc* are tricky because they internally end up leading to
+# calls to (all-bindings) and (all-dynamics)...which in their zero
+# argument versions don't allow specifying to look only in a
+# specific environment and/or just look for locals.  the use of the
+# fiber below is a work-around so that information from this script
+# doesn't end up "polluting" the results.  eval-string with an
+# environment set to root-env didn't appear to work...
+(defn do-doc
+  [doc-arg]
+  (def fib (fiber/new (fn [doc-arg]
+                        (def buf @"")
+                        (with-dyns [:out buf] (doc* doc-arg))
+                        buf)
+                      :y root-env))
+  #
+  (resume fib doc-arg))
+
+(defn report-index
+  [[bindings dynamics]]
+  #
+  (when (and (empty? bindings) (empty? dynamics))
+    (print not-found-message)
+    (break))
+  #
+  (when bindings
+    (printf "%sBindings found:" indent-ws)
+    (print)
+    (each b bindings (printf "%s%s" indent-ws b)))
+  #
+  (when dynamics
+    (printf "%sDynamics found:" indent-ws)
+    (print)
+    (each d dynamics (printf "%s%s" indent-ws d))))
+
+(defn massage-doc
+  [doc-arg doc-buf]
+  #
+  (def trimmed (string/trim doc-buf "\n"))
+  #
+  (def arg-type (-> (string/split "\n" trimmed)
+                    first
+                    string/trim))
+  #
+  (when (get {"function" 1 "cfunction" 1 "macro" 1} arg-type)
+    (break (dedent trimmed)))
+  #
+  (def parts (string/split "\n\n" trimmed))
+  (when (not parts)
+    (errorf "failed to parse docstring: %s" doc-buf))
+  #
+  (def [pre post] parts)
+  #
+  (def pre-d (dedent pre))
+  (def post-d (dedent post))
+  #
+  (string/format "%s\n\n%s%s\n\n%s" pre-d indent-ws doc-arg post-d))
+
+(defn report-item
+  [doc-arg doc-buf]
+  (print)
+  (print (massage-doc doc-arg doc-buf))
+  (print))
+
+########################################################################
+
 (defn main
-  [& argv]
-  (def arg (get argv 1))
-
-  # option handling, except --raw-all
-  (when (and arg
-             (nil? (get {"-" true
-                         "--" true
-                         "-=" true
-                         "->" true
-                         "->>" true
-                         "-?>" true
-                         "-?>>" true}
-                        arg))
-             (string/has-prefix? "-" arg)
-             (not= "--raw-all" arg))
-    (cond
-      (or (= "--help" arg) (= "-h" arg))
-      (print usage)
-      #
-      (= "--bash-completion" arg)
-      (print bash-completion)
-      #
-      (= "--fish-completion" arg)
-      (print fish-completion)
-      #
-      (= "--zsh-completion" arg)
-      (print zsh-completion)
-      #
-      (do
-        (eprintf "unrecognized option or symbol: %s" arg)
-        (eprint "Try jdoc -h for usage.")
-        (os/exit 1)))
-    (os/exit 0))
-
-  (when (= "--raw-all" arg)
-    (each binding (all-bindings)
+  [_ & args]
+  (def opts (parse-args args))
+  #
+  (def {:rest the-args} opts)
+  #
+  (def arg (get the-args 0))
+  #
+  (def root-bindings (all-bindings root-env))
+  #
+  (cond
+    (def ui (get opts :unknown-item))
+    (do
+      (eprintf "unrecognized option or symbol: %s" ui)
+      (eprint "Try jdoc -h for usage.")
+      (os/exit 1))
+    #
+    (get opts :help)
+    (print usage)
+    #
+    (get opts :bash-completion)
+    (print bash-completion)
+    #
+    (get opts :fish-completion)
+    (print fish-completion)
+    #
+    (get opts :zsh-completion)
+    (print zsh-completion)
+    # mostly for supporting shell completion
+    (get opts :raw-all)
+    (each binding root-bindings
       (print (escape binding)))
-    (os/exit 0))
-
-  (def doc-arg
-    (if arg
-      (if (get (curenv) (symbol arg))
-        arg
-        (string/format `"%s"` arg))
-      (do
-        (def bz (all-bindings))
-        (def idx (math/rng-int (math/rng (os/cryptorand 3))
-                               (length bz)))
-        (get bz idx))))
-
-  (eval-string (string/format "(doc %s)" doc-arg)))
-
-## future possibilities ##
-
-# * docstrings from within "current" project
+    # enumerate docs for files and/or directories
+    (get opts :enum-docs)
+    (let [results (do-all-docs opts)]
+      (when (not results)
+        (print not-found-message)))
+    # base results on files and/or directories searching
+    (get opts :paths-search)
+    (let [results (do-doc-of opts)]
+      (when (not results)
+        (print not-found-message)))
+    # base results on janet built-ins
+    (get opts :builtins-search)
+    (let [doc-arg
+          (if arg
+            (let [sym (symbol arg)]
+              (if (get root-env sym)
+                sym
+                (string/format `"%s"` arg)))
+            (when (get opts :random)
+              (def idx (math/rng-int (math/rng (os/cryptorand 3))
+                                     (length root-bindings)))
+              (get root-bindings idx)))]
+      (when (not doc-arg)
+        (print usage)
+        (os/exit 0))
+      #
+      (def buf (do-doc doc-arg))
+      #
+      (if-let [index (is-index? buf)]
+        (report-index index)
+        (report-item doc-arg buf)))
+    # XXX: don't expect to get here
+    (errorf "bug somewhere: args: %n opts: %n" args opts)))
 
