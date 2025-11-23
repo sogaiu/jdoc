@@ -2895,12 +2895,12 @@
     (print r/not-found-message)
     (break))
   #
-  (when bindings
+  (when (not (empty? bindings))
     (printf "%sBindings found:" r/indent-ws)
     (print)
     (each b bindings (printf "%s%s" r/indent-ws b)))
   #
-  (when dynamics
+  (when (not (empty? dynamics))
     (printf "%sDynamics found:" r/indent-ws)
     (print)
     (each d dynamics (printf "%s%s" r/indent-ws d))))
@@ -3016,9 +3016,7 @@
     (let [doc-arg
           (if arg
             (let [sym (symbol arg)]
-              (if (get root-env sym)
-                sym
-                (string/format `"%s"` arg)))
+              (if (get root-env sym) sym arg))
             (when (get opts :random)
               (def idx (math/rng-int (math/rng (os/cryptorand 3))
                                      (length root-bindings)))
