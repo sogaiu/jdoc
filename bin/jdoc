@@ -2373,8 +2373,9 @@
   (while (def next-zloc
            (z/search-from cur-zloc
                           |(match (z/node $)
-                             [:symbol _ (@ name)]
-                             $)))
+                             [:symbol _ sym]
+                             (when (string/has-suffix? name sym)
+                               $))))
     (def parent-zloc (z/up next-zloc))
     (when (= :tuple (get (z/node parent-zloc) 0))
       (def node (z/node parent-zloc))
@@ -2384,26 +2385,31 @@
           (parse raw-code-str)
           ([e]
             (eprintf "failed to parse: %s" raw-code-str))))
-      (when (and parsed (= name (string (get parsed 1))))
-        (def head (first parsed))
-        (cond
-          (and (get f/special-definers head)
-               (<= 4 (length parsed))) # metadata possible
-          (when-let [ds-tbl (f/find-special-docstring (z/down parent-zloc))]
-            (array/push results
-                        (merge ds-tbl {:def-type (string head)})))
-          #
-          (get f/call-definers head)
-          (when-let [ds-tbl (f/find-caller-docstring (z/down parent-zloc))]
-            (array/push results
-                        (merge ds-tbl {:def-type (string head)})))
-          #
-          (and (= 'defdyn head) (= 3 (length parsed)))
-          (when-let [ds-tbl (f/find-defdyn-docstring (z/down parent-zloc))]
-            (array/push results
-                        (merge ds-tbl {:def-type (string head)})))
-          # XXX: other cases?
-          nil)))
+      (when parsed
+        (def found-name (string (get parsed 1)))
+        (when (string/has-suffix? name found-name)
+          (def head (first parsed))
+          (cond
+            (and (get f/special-definers head)
+                 (<= 4 (length parsed))) # metadata possible
+            (when-let [ds-tbl (f/find-special-docstring (z/down parent-zloc))]
+              (array/push results
+                          (merge ds-tbl {:def-type (string head)
+                                         :found-name found-name})))
+            #
+            (get f/call-definers head)
+            (when-let [ds-tbl (f/find-caller-docstring (z/down parent-zloc))]
+              (array/push results
+                          (merge ds-tbl {:def-type (string head)
+                                         :found-name found-name})))
+            #
+            (and (= 'defdyn head) (= 3 (length parsed)))
+            (when-let [ds-tbl (f/find-defdyn-docstring (z/down parent-zloc))]
+              (array/push results
+                          (merge ds-tbl {:def-type (string head)
+                                         :found-name found-name})))
+            # XXX: other cases?
+            nil))))
     #
     (set cur-zloc (z/df-next next-zloc)))
   #
@@ -2427,10 +2433,12 @@
   # =>
   @[@{:bc 3 :bl 2
       :def-type "defn"
+      :found-name "smile"
       :text `"I am a defn docstring."`
       :params-str "[y]"}
     @{:bc 3 :bl 7
       :def-type "defn-"
+      :found-name "smile"
       :text `"I am a defn- docstring."`
       :params-str "[z]"}]
 
@@ -2444,9 +2452,11 @@
   # =>
   @[@{:bc 12 :bl 1
       :def-type "var"
+      :found-name "smile"
       :text `"a docstring"`}
     @{:bc 13 :bl 3
       :def-type "var-"
+      :found-name "smile"
       :text `"woohoo"`}]
 
   (f/find-doc-of
@@ -2459,6 +2469,7 @@
   # =>
   @[@{:bc 17 :bl 3
       :def-type "defdyn"
+      :found-name "*smile*"
       :text `"smiling docstring"`}]
 
   (f/find-doc-of
@@ -2476,6 +2487,7 @@
   # =>
   @[@{:bc 3 :bl 2
       :def-type "defmacro"
+      :found-name "as-macro"
       :text
       (string
         "``Use a function or macro literal `f` as a macro. This lets\n"
@@ -2497,9 +2509,11 @@
   # =>
   @[@{:bc 12 :bl 1
       :def-type "def"
+      :found-name "smile"
       :text `"a docstring"`}
     @{:bc 3 :bl 4
       :def-type "defn"
+      :found-name "smile"
       :text `"I am a docstring."`
       :params-str "[y]"}]
 
@@ -2743,7 +2757,14 @@
     (def line-1 (r/make-line-1 def-type))
     (def line-2 (string/format "%s%s on line %d, column %d"
                                r/indent-ws path line-no col-no))
-    (def name (if name name (get r :name)))
+    (def name (cond
+                (def found-name (get r :found-name))
+                found-name
+                #
+                (def name (get r :name))
+                name
+                #
+                name))
     (def usage
       (if-not (get r :params-str)
         name
