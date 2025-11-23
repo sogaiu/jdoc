@@ -18,7 +18,9 @@
 
   Additionaly, with one or more file-or-directory paths
   specified, search for docstrings in paths.  Directories are
-  searched recursively for `.janet` files.
+  searched recursively for `.janet` files.  A file that does
+  not have a `.janet` extension may also be searched if it
+  appears to have an appropriate shebang line.
 
   With a partial identifier, but no options, show candidates
   with docstrings, but only for builtin janet constructs.
@@ -162,6 +164,14 @@
   "/"
 
   )
+
+(defn has-janet-shebang?
+  [path]
+  (with [f (file/open path)]
+    (def first-line (file/read f :line))
+    (when first-line
+      (and (string/find "env" first-line)
+           (string/find "janet" first-line)))))
 
 (defn collect-paths
   [includes &opt pred]
@@ -2792,7 +2802,8 @@
   (def includes the-args)
   # find .janet files
   (def src-filepaths
-    (collect-paths includes |(string/has-suffix? ".janet" $)))
+    (collect-paths includes |(or (string/has-suffix? ".janet" $)
+                                 (has-janet-shebang? $))))
   #
   (search-and-report {:query-fn find-docs
                       :paths src-filepaths}))
@@ -2807,7 +2818,8 @@
   (def includes the-args)
   # find .janet files
   (def src-filepaths
-    (collect-paths includes |(string/has-suffix? ".janet" $)))
+    (collect-paths includes |(or (string/has-suffix? ".janet" $)
+                                 (has-janet-shebang? $))))
   #
   (search-and-report {:query-fn find-doc-of
                       :paths src-filepaths :name name}))
