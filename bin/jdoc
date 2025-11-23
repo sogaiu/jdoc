@@ -3016,7 +3016,10 @@
     (let [doc-arg
           (if arg
             (let [sym (symbol arg)]
-              (if (get root-env sym) sym arg))
+              (if (and (get root-env sym)
+                       (not (get opts :string-search)))
+                sym
+                arg))
             (when (get opts :random)
               (def idx (math/rng-int (math/rng (os/cryptorand 3))
                                      (length root-bindings)))
