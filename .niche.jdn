@@ -1,0 +1,6 @@
+{
+ # describes what to test - file and dir paths
+ :includes ["bin/jdoc"]
+ # describes what to skip - file paths only
+ :excludes []
+}
