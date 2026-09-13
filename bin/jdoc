@@ -135,8 +135,14 @@
 
   (def doc-arg
     (if arg
-      (if (get (curenv) (symbol arg))
+      (cond
+        (get (curenv) (symbol arg))
         arg
+        #
+        (index-of (symbol arg) '[break def do fn if quasiquote quote
+                                 set splice unquote upscope var while])
+        arg
+        #
         (string/format `"%s"` arg))
       (do
         (def bz (all-bindings))
