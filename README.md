@@ -12,6 +12,17 @@ note that the uninstallation process is likely to end up being
 different.  See the [Uninstallation section](#uninstallation) later in
 this document for details.
 
+### Via Symlinking with `PATH`
+
+If `$HOME/bin` is on your `PATH`:
+
+```
+cd ~/src
+git clone https://github.com/sogaiu/jdoc
+cd ~/bin
+ln -s ~/src/jdoc .
+```
+
 ### Via `jeep`
 
 ```
@@ -190,3 +201,5 @@ but if you want to be on the careful side, you might consider running
 both commands and examining their respective output before attempting
 uninstallation commands.
 
+If you used the symlink method, removing the link and
+deleting the cloned directory should be enough.
