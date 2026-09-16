@@ -135,7 +135,7 @@
     (os/exit 0))
 
   (when (= "--raw-all" arg)
-    (each name (all-bindings)
+    (each name (all-bindings root-env)
       (print (escape name)))
     (os/exit 0))
 
@@ -151,7 +151,7 @@
         #
         (string/format `"%s"` arg))
       (do
-        (def all-names (all-bindings))
+        (def all-names (all-bindings root-env))
         (def idx (math/rng-int (math/rng (os/cryptorand 3))
                                (length all-names)))
         (get all-names idx))))
