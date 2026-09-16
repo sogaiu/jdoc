@@ -8,6 +8,8 @@
 
     -h, --help                   show this output
 
+    -a, --all                    show all docstrings
+
     --bash-completion            output bash-completion bits
     --fish-completion            output fish-completion bits
     --zsh-completion             output zsh-completion bits
@@ -121,6 +123,10 @@
       #
       (= "--zsh-completion" arg)
       (print zsh-completion)
+      #
+      (or (= "--all" arg) (= "-a" arg))
+      (each sym (all-bindings root-env)
+        (doc* sym))
       #
       (do
         (eprintf "unrecognized option or symbol: %s" arg)
