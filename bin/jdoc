@@ -129,8 +129,8 @@
     (os/exit 0))
 
   (when (= "--raw-all" arg)
-    (each binding (all-bindings)
-      (print (escape binding)))
+    (each name (all-bindings)
+      (print (escape name)))
     (os/exit 0))
 
   (def doc-arg
@@ -145,10 +145,10 @@
         #
         (string/format `"%s"` arg))
       (do
-        (def bz (all-bindings))
+        (def all-names (all-bindings))
         (def idx (math/rng-int (math/rng (os/cryptorand 3))
-                               (length bz)))
-        (get bz idx))))
+                               (length all-names)))
+        (get all-names idx))))
 
   (eval-string (string/format "(doc %s)" doc-arg)))
 
