@@ -114,6 +114,8 @@ View Janet docstrings from the command line.
 
   -h, --help                   show this output
 
+  -a, --all                    show all docstrings
+
   --bash-completion            output bash-completion bits
   --fish-completion            output fish-completion bits
   --zsh-completion             output zsh-completion bits
